@@ -70,6 +70,7 @@ def CreateGPUConnector(
             VLLMPagedMemGPUConnectorV3,
             VLLMPagedMemLayerwiseGPUConnector,
         )
+        from lmcache.v1.gpu_connector.gpu_connectors import VLLMPagedMemCPUConnectorV2
 
         local_worker_id = metadata.local_worker_id
         torch_dev, dev_name = get_vllm_torch_dev()
@@ -116,6 +117,11 @@ def CreateGPUConnector(
             )
 
             return VLLMPagedMemHPUConnectorV2.from_metadata(metadata, use_gpu, device)
+        elif dev_name == "cpu":
+            # CPU fallback hack - reuse V2 connector with CPU device
+            return VLLMPagedMemCPUConnectorV2.from_metadata(
+                metadata, use_gpu, device, layout_hints=layout_hints
+            )
         else:
             raise RuntimeError("No supported connector found for the current platform.")
 
