@@ -235,36 +235,103 @@ class VLLMPagedMemCPUConnectorV2(GPUConnectorInterface):
     # ==================== 必须实现的接口方法 ====================
     
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
-        print("using cpu connector to_gpu")
-        """
-        从 LMCache MemoryObj 加载到 vLLM 的 CPU Page Cache。
-        
-        注意：虽然方法名叫 to_gpu，但在 CPU 版本中，"GPU" 只是历史遗留命名。
-        实际传输方向：MemoryObj (CPU) -> vLLM Page Cache (CPU)
-        """
+        assert memory_obj.tensor is not None
+
         self.initialize_kvcaches_ptr(**kwargs)
-        assert self.kvcaches is not None
-        
-        # 获取 slot_mapping（vLLM 的页映射）
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-        
-        # 获取 CPU 指针表
-        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
-        
-        # 核心传输：CPU to CPU 的 memcpy
-        # 可以直接调用 lmc_ops.multi_layer_kv_transfer，只要内核支持 CPU 地址
-        # 或者使用 torch 的原生操作
-        lmc_ops.multi_layer_kv_transfer(
-            memory_obj.tensor,           # 源：LMCache MemoryObj (CPU)
-            kv_cache_pointers,           # 目标：vLLM Page Cache 地址表 (CPU)
-            slot_mapping[start:end],     # 页映射
-            self.kvcaches[0].device,     # device (CPU)
-            self.page_buffer_size,
-            lmc_ops.TransferDirection.H2D,  # H2D 语义：从 LMCache (Host) 到 Device (vLLM Cache)
-            self.gpu_kv_format,
-            block_size=self.block_size,
-            head_size=self.head_size,
+
+
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
         )
+
+        if self.use_mla:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
+                raise ValueError(
+                    "The memory object should be in KV_MLA_FMT format in"
+                    " order to be processed by VLLMPagedMemGPUConnector"
+                )
+        else:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
+                raise ValueError(
+                    "The memory object should be in KV_2LTD format in"
+                    " order to be processed by VLLMPagedMemGPUConnector"
+                )
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+
+        kv_cache_device = self.kvcaches[0].device
+        print("to_gpu: memory_obj.tensor.device:", memory_obj.tensor.device, "kv_cache_device:", kv_cache_device)
+
+        # avoid read/write stream race condition for shared block
+        # this will only be potentially non-zero for the first
+        # block lmcache is transferring back
+        vllm_cached = kwargs.get("vllm_cached_tokens", 0)
+        skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
+       
+        print(
+            "to_gpu: transfer from CPU to CPU, using CPU fallback copy path."
+        )
+
+
+        print("=== to_gpu CPU fallback ENTER ===", flush=True)
+
+        kv0 = self.kvcaches[0]
+        print(f"[chk] is_contiguous={kv0.is_contiguous()}", flush=True)
+        print(f"[chk] shape={tuple(kv0.shape)}  stride={kv0.stride()}", flush=True)
+        print("memory_obj.tensor:", memory_obj.tensor.shape,
+            memory_obj.tensor.device, memory_obj.tensor.dtype, flush=True)
+        print("kvcaches[0]:", self.kvcaches[0].shape,
+            self.kvcaches[0].device, self.kvcaches[0].dtype, flush=True)
+
+        print("kvcaches[1]:", self.kvcaches[1].shape,
+            self.kvcaches[1].device, self.kvcaches[1].dtype, flush=True)
+        print("start,end:", start, end, flush=True)
+        print("slot_mapping", slot_mapping.shape, slot_mapping.device, slot_mapping.dtype, flush=True)
+        print("slot_mapping", slot_mapping)
+
+
+        sm = slot_mapping[start:end].to("cpu", dtype=torch.long)
+
+        kv0 = self.kvcaches[0]
+        _, num_blocks, heads, block_size, head_size = kv0.shape
+
+        hidden_dim = memory_obj.tensor.shape[-1]
+        num_kv_heads = hidden_dim // head_size
+
+        vllm_cached = kwargs.get("vllm_cached_tokens", 0)
+        skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
+        print("memory object", memory_obj.tensor[0, 0, 0, :]) # k=0, l=0 s=0, 
+        # CPU vLLM layout: [2, num_blocks, num_kv_heads, block_size, head_size]
+        for layer_idx, kv_cache in enumerate(self.kvcaches):
+            print("layer_idx", layer_idx)
+            print("sm", sm)
+            print("sm.tolist()", sm.tolist())
+            for local_i, slot in enumerate(sm.tolist()):
+                if local_i < skip_prefix_n_tokens or slot < 0:
+                    continue
+                block_id = slot // block_size
+                block_offset = slot % block_size
+                print("block_id, block_offset", block_id, block_offset)
+                tmp_mem = memory_obj.tensor[:, layer_idx, local_i, :]
+                print(f"tmp_mem.shape", tmp_mem.shape)
+                token_kv = tmp_mem.reshape(
+                    2, num_kv_heads, head_size) # src is 【2， 16， 256， 512】
+                print("tmp_mem", tmp_mem)
+                kv_cache[0, block_id, :, block_offset, :].copy_(token_kv[0]) # 【8，64】
+                kv_cache[1, block_id, :, block_offset, :].copy_(token_kv[1])
+            tmp_tensor = self.kvcaches[0][0, sm.tolist()[0] // block_size, :, 0:32, :].cpu()
+            tmp_tensor = tmp_tensor.permute(1, 0, 2).contiguous()
+            print("layer 0 k cache after copy", tmp_tensor.shape, tmp_tensor)
+
+        print("=== to_gpu CPU fallback EXIT ===", flush=True)
+        
+        return
+
     
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         print("using cpu connector from_gpu")
