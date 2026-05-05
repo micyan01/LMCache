@@ -36,6 +36,81 @@ import lmcache.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 
+def _get_vllm_cpu_attn_isa(kv_cache: torch.Tensor, block_size: int) -> str:
+    is_amx_supported = getattr(torch.cpu, "_is_amx_tile_supported", lambda: False)
+    if (
+        is_amx_supported()
+        and kv_cache.dtype == torch.bfloat16
+        and block_size % 32 == 0
+    ):
+        return "amx"
+    if block_size % 32 == 0:
+        return "vec"
+    return "vec16"
+
+
+def _restore_vllm_cpu_kv_cache(
+    memory_obj: MemoryObj,
+    kvcaches: List[torch.Tensor],
+    slot_mapping: torch.Tensor,
+    start: int,
+    end: int,
+    skip_prefix_n_tokens: int,
+) -> None:
+    """Restore KV into vLLM CPU cache using vLLM's native cache writer.
+
+    vLLM CPU attention may physically pack KV cache blocks for a selected ISA
+    (for example AMX bf16). Writing the logical HND layout directly can leave
+    restored prefix tokens in a different physical layout from newly decoded
+    tokens. Reuse vLLM's CPU reshape/cache op so both paths agree.
+    """
+    if memory_obj.tensor is None:
+        raise ValueError("memory_obj.tensor must be set")
+    if not kvcaches:
+        raise ValueError("kvcaches must not be empty")
+
+    kv0 = kvcaches[0]
+    if len(kv0.shape) != 5 or kv0.shape[0] != 2:
+        raise ValueError(f"Unsupported vLLM CPU KV cache shape: {tuple(kv0.shape)}")
+
+    _, _, num_kv_heads, block_size, head_size = kv0.shape
+    hidden_dim_size = memory_obj.tensor.shape[-1]
+    if hidden_dim_size != num_kv_heads * head_size:
+        raise ValueError(
+            "Memory object hidden dim does not match CPU KV cache shape: "
+            f"hidden_dim={hidden_dim_size}, "
+            f"num_kv_heads={num_kv_heads}, head_size={head_size}"
+        )
+
+    local_slots = slot_mapping[start:end].to("cpu", dtype=torch.long)
+    valid_local_indices = [
+        i
+        for i, slot in enumerate(local_slots.tolist())
+        if i >= skip_prefix_n_tokens and slot >= 0
+    ]
+    if not valid_local_indices:
+        return
+
+    valid_slots = local_slots[valid_local_indices].contiguous()
+    valid_indices = torch.tensor(valid_local_indices, dtype=torch.long)
+    cpu_attn_isa = _get_vllm_cpu_attn_isa(kv0, block_size)
+
+    import vllm._custom_ops as vllm_ops
+
+    for layer_idx, kv_cache in enumerate(kvcaches):
+        key_cache, value_cache = kv_cache.unbind(0)
+        layer_tensor = memory_obj.tensor[:, layer_idx, valid_indices, :]
+        keys = layer_tensor[0].reshape(
+            len(valid_local_indices), num_kv_heads, head_size
+        ).to(dtype=kv_cache.dtype).contiguous()
+        values = layer_tensor[1].reshape(
+            len(valid_local_indices), num_kv_heads, head_size
+        ).to(dtype=kv_cache.dtype).contiguous()
+        vllm_ops.cpu_attn_reshape_and_cache(
+            keys, values, key_cache, value_cache, valid_slots, cpu_attn_isa
+        )
+
+
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -195,8 +270,12 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 shape, dtype=kwargs["dtype"], device=kwargs["device"]
             )
 
-        self.store_stream = torch.cuda.Stream()
-        self.load_stream = torch.cuda.Stream()
+        if torch.cuda.is_available():
+            self.store_stream: Optional[torch.cuda.Stream] = torch.cuda.Stream()
+            self.load_stream: Optional[torch.cuda.Stream] = torch.cuda.Stream()
+        else:
+            self.store_stream = None
+            self.load_stream = None
 
     @classmethod
     def from_metadata(
@@ -304,14 +383,26 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
-
         # avoid read/write stream race condition for shared block
         # this will only be potentially non-zero for the first
         # block lmcache is transferring back
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
+        if self.kvcaches[0].device.type == "cpu":
+            if self.use_mla:
+                raise ValueError("vLLM CPU KV restore does not support MLA layout yet")
+            _restore_vllm_cpu_kv_cache(
+                memory_obj,
+                self.kvcaches,
+                slot_mapping,
+                start,
+                end,
+                skip_prefix_n_tokens,
+            )
+            return
+
+        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
         lmc_ops.multi_layer_kv_transfer(
             memory_obj.tensor,
             kv_cache_pointers,
@@ -399,6 +490,11 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        if self.load_stream is None:
+            for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+                self.to_gpu(memory_obj, start, end, **kwargs)
+            return
+
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
